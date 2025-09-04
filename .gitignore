@@ -1,0 +1,11 @@
+# Model folders
+gpt2_harry_potter_model_archive/
+gpt2_124M/
+
+# Model weights
+best_model.pth
+harry_potter_GPT2_Finetuned.pth
+multitask_potter_finetuned.pth
+
+*.pth
+*.csv
