@@ -145,16 +145,25 @@ def load_models_and_tokenizer():
     for model_name, model_path in MODEL_WEIGHTS_PATHS.items():
         print(f"\n----- Loading model: '{model_name}' -----")
         try:
-            # --- (MODIFIED) Look up the correct config for the current model ---
+            # --- Use the correct config for this model ---
             config = MODEL_CONFIGS[model_name]
             model = GPTModel(config)
             print(f"Instantiating model with config: qkv_bias={config['qkv_bias']}")
 
-            model.load_state_dict(torch.load(model_path, map_location=DEVICE))
+            # --- Load weights, allow missing buffers (like att.mask) ---
+            state_dict = torch.load(model_path, map_location=DEVICE)
+            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+
+            if missing:
+                print(f"Warning: Missing keys for '{model_name}': {missing}")
+            if unexpected:
+                print(f"Warning: Unexpected keys for '{model_name}': {unexpected}")
+
             model.to(DEVICE)
             model.eval()
             MODELS[model_name] = model
             print(f"Model '{model_name}' loaded successfully onto {DEVICE}.")
+
         except FileNotFoundError:
             print(f"FATAL ERROR: Model weights for '{model_name}' not found at '{model_path}'")
             print("Please ensure the .pth file is in the same directory as this script.")
@@ -243,9 +252,9 @@ def handle_generation():
         
     max_tokens = 70
     if prompt.strip().startswith("[SORTING]"):
-        max_tokens = 30
+        max_tokens = 70
     elif prompt.strip().startswith("[SPELL]"):
-        max_tokens = 10
+        max_tokens = 70
     elif prompt.strip().startswith("[CHAT]"):
         max_tokens = 80
         
