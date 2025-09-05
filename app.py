@@ -1,7 +1,9 @@
 # =============================================================================
 # POTTERVERSE AI - BACKEND SERVER (FLASK) - UPGRADED
-# This version includes temperature/top-k sampling for more creative generation
-# and dynamically sets the output token length based on the task prefix.
+# This version includes temperature/top-k sampling for more creative generation,
+# dynamically sets the output token length based on the task prefix,
+# supports switching between multiple fine-tuned models,
+# and uses the correct model configuration for each set of weights.
 # =============================================================================
 
 import torch
@@ -25,6 +27,11 @@ GPT_CONFIG_124M = {
     "vocab_size": 50257, "context_length": 1024, "emb_dim": 768,
     "n_heads": 12, "n_layers": 12, "drop_rate": 0.1, "qkv_bias": False
 }
+
+# --- Create a separate config for the pretrained GPT-2 model which uses a bias ---
+gpt_config_pretrained = GPT_CONFIG_124M.copy()
+gpt_config_pretrained.update({"qkv_bias": True})
+
 
 class LayerNorm(nn.Module):
     def __init__(self, emb_dim):
@@ -103,52 +110,71 @@ class GPTModel(nn.Module):
         return self.out_head(x)
 
 # =============================================================================
-# SECTION 2: GLOBAL VARIABLES AND MODEL LOADING
+# SECTION 2: GLOBAL VARIABLES
 # =============================================================================
 
-MODEL_WEIGHTS_PATH = "./multitask_potter_finetuned.pth"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-MODEL = None
 TOKENIZER = None
 
-def load_model_and_tokenizer():
-    """Loads the fine-tuned model and tokenizer into memory."""
-    global MODEL, TOKENIZER
+# =============================================================================
+# SECTION 2.5: DUAL MODEL MANAGEMENT (UPGRADED)
+# =============================================================================
+
+# --- Map model names to their weight file paths ---
+MODEL_WEIGHTS_PATHS = {
+    "multitask": "./multitask_potter_finetuned.pth",
+    "gpt2": "./harry_potter_GPT2_Finetuned.pth"
+}
+
+# --- (NEW) Map model names to their configuration dictionaries ---
+MODEL_CONFIGS = {
+    "multitask": GPT_CONFIG_124M,
+    "gpt2": gpt_config_pretrained
+}
+
+# --- Dictionary to hold the loaded models in memory ---
+MODELS = { "multitask": None, "gpt2": None }
+
+def load_models_and_tokenizer():
+    """Loads all specified models and the tokenizer into memory at startup."""
+    global MODELS, TOKENIZER
     
-    print("Loading model and tokenizer...")
+    print("Loading tokenizer...")
     TOKENIZER = tiktoken.get_encoding("gpt2")
     
-    MODEL = GPTModel(GPT_CONFIG_124M)
-    try:
-        MODEL.load_state_dict(torch.load(MODEL_WEIGHTS_PATH, map_location=DEVICE))
-        print(DEVICE)
-        MODEL.to(DEVICE)
-        MODEL.eval()  # Set model to evaluation mode
-        print(f"Model loaded successfully onto {DEVICE}.")
-    except FileNotFoundError:
-        print(f"FATAL ERROR: Model weights not found at '{MODEL_WEIGHTS_PATH}'")
-        print("Please ensure the .pth file is in the same directory as this script.")
-        exit()
+    for model_name, model_path in MODEL_WEIGHTS_PATHS.items():
+        print(f"\n----- Loading model: '{model_name}' -----")
+        try:
+            # --- (MODIFIED) Look up the correct config for the current model ---
+            config = MODEL_CONFIGS[model_name]
+            model = GPTModel(config)
+            print(f"Instantiating model with config: qkv_bias={config['qkv_bias']}")
+
+            model.load_state_dict(torch.load(model_path, map_location=DEVICE))
+            model.to(DEVICE)
+            model.eval()
+            MODELS[model_name] = model
+            print(f"Model '{model_name}' loaded successfully onto {DEVICE}.")
+        except FileNotFoundError:
+            print(f"FATAL ERROR: Model weights for '{model_name}' not found at '{model_path}'")
+            print("Please ensure the .pth file is in the same directory as this script.")
+        except Exception as e:
+            print(f"An error occurred while loading model '{model_name}': {e}")
 
 # =============================================================================
 # SECTION 3: TEXT GENERATION LOGIC (UPGRADED)
 # =============================================================================
 
 def generate(model, idx, max_new_tokens, context_size, temperature=0.7, top_k=50):
-    """
-    Generates text from a starting token index using temperature and top-k sampling.
-    """
+    """Generates text from a starting token index using a specific model instance."""
     for _ in range(max_new_tokens):
         idx_cond = idx[:, -context_size:]
         with torch.no_grad():
             logits = model(idx_cond)
         
         logits = logits[:, -1, :]
-
-        # Apply temperature scaling
         if temperature > 0:
             logits = logits / temperature
-            # Apply top-k sampling
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
@@ -160,24 +186,25 @@ def generate(model, idx, max_new_tokens, context_size, temperature=0.7, top_k=50
             break
             
         idx = torch.cat((idx, idx_next), dim=1)
-    
     return idx
 
-def generate_text_from_prompt(prompt, max_new_tokens=60, temperature=0.7, top_k=50):
-    """Encodes a prompt, generates text, and decodes the result."""
-    if not MODEL or not TOKENIZER:
-        return "Error: Model not loaded."
+def generate_text_from_prompt(model_to_use, model_choice, prompt, max_new_tokens=60, temperature=0.7, top_k=50):
+    """Encodes a prompt, generates text using the selected model, and decodes the result."""
+    if not model_to_use or not TOKENIZER:
+        return "Error: Model not loaded or tokenizer not available."
 
     generation_prompt = f"{prompt} <|endoftext|>"
-    
     encoded = TOKENIZER.encode(generation_prompt, allowed_special={"<|endoftext|>"})
     idx = torch.tensor(encoded, dtype=torch.long, device=DEVICE).unsqueeze(0)
 
+    # --- (MODIFIED) Get context size from the correct config based on model_choice ---
+    context_size = MODEL_CONFIGS[model_choice]["context_length"]
+
     output_ids = generate(
-        model=MODEL,
+        model=model_to_use,
         idx=idx,
         max_new_tokens=max_new_tokens,
-        context_size=GPT_CONFIG_124M["context_length"],
+        context_size=context_size,
         temperature=temperature,
         top_k=top_k
     )
@@ -199,37 +226,43 @@ CORS(app)
 
 @app.route('/generate', methods=['POST'])
 def handle_generation():
-    """API endpoint to handle text generation requests."""
+    """API endpoint to handle text generation requests, with model selection."""
     data = request.get_json()
     if not data or 'prompt' not in data:
         return jsonify({"error": "Prompt not provided"}), 400
 
     prompt = data['prompt']
+    model_choice = data.get('model_choice', 'multitask').lower()
     
-    # --- Dynamic Token Length based on Prefix ---
-    max_tokens = 70 # Default length
+    if model_choice not in MODELS:
+        return jsonify({"error": f"Invalid model choice: '{model_choice}'.", "available_models": list(MODELS.keys())}), 400
+
+    selected_model = MODELS[model_choice]
+    if selected_model is None:
+        return jsonify({"error": f"Model '{model_choice}' is not available or failed to load."}), 500
+        
+    max_tokens = 70
     if prompt.strip().startswith("[SORTING]"):
         max_tokens = 30
-        print(f"Task detected: [SORTING]. Setting max_tokens to {max_tokens}.")
     elif prompt.strip().startswith("[SPELL]"):
         max_tokens = 10
-        print(f"Task detected: [SPELL]. Setting max_tokens to {max_tokens}.")
     elif prompt.strip().startswith("[CHAT]"):
         max_tokens = 80
-        print(f"Task detected: [CHAT]. Setting max_tokens to {max_tokens}.")
-    else:
-        print(f"No task prefix detected. Using default max_tokens: {max_tokens}.")
         
     print(f"\nReceived prompt: {prompt}")
+    print(f"Using model: '{model_choice}'")
     
-    # Call the generation function with the dynamic token length
-    completion = generate_text_from_prompt(prompt, max_new_tokens=max_tokens)
+    # --- (MODIFIED) Pass model_choice to the generation function ---
+    completion = generate_text_from_prompt(
+        model_to_use=selected_model,
+        model_choice=model_choice, 
+        prompt=prompt, 
+        max_new_tokens=max_tokens
+    )
     
     print(f"Generated completion: {completion}")
-    
     return jsonify({"completion": completion})
 
 if __name__ == '__main__':
-    load_model_and_tokenizer()
-    app.run(host="0.0.0.0", port=5000, debug=False) # debug=False is better for 'production'
-
+    load_models_and_tokenizer()
+    app.run(host="0.0.0.0", port=5000, debug=False)
